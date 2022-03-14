@@ -36,12 +36,15 @@ namespace nav2_smac_planner
 // defining static member for all instance to share
 LookupTable NodeHybrid::obstacle_heuristic_lookup_table;
 double NodeHybrid::travel_distance_cost = sqrt(2);
+double NodeHybrid::turn_inplace_cost = sqrt(2)*16.0/64.0; // sqrt(2)*16/num_quantization means every 22.5deg rotation equals to one straight motion
+double NodeHybrid::lateral_motion_cost = sqrt(2)+0.2; // Just to see more lateral motions - Lateral motions have two disadvantages (limited FOV - Odometry deficiency)
 HybridMotionTable NodeHybrid::motion_table;
 float NodeHybrid::size_lookup = 25;
 LookupTable NodeHybrid::dist_heuristic_lookup_table;
 nav2_costmap_2d::Costmap2D * NodeHybrid::sampled_costmap = nullptr;
 CostmapDownsampler NodeHybrid::downsampler;
 ObstacleHeuristicQueue NodeHybrid::obstacle_heuristic_queue;
+MotionModel NodeHybrid::motion_model_;
 
 // Each of these tables are the projected motion models through
 // time and space applied to the search on the current node in
@@ -219,6 +222,95 @@ void HybridMotionTable::initReedsShepp(
   }
 }
 
+// Omni motion primitives have an important different in comparison with
+// Dubin and ReedsShepp and that is in place rotation. By In place rotation,
+// the robot will not be projected to the neighbor cell.
+// Motion primitives *at this moment* are same as Dubins + rotate in place
+// (clock and counter clock wise) + lateral sliding (left and right)
+// Note that we still need Dubins motions for a smooth planning, instead of a
+// basic turn in place then move forward, move fwd while rotating. TODO Q: does
+// trajectory planner take care of this? Do we really need this fwd while rotatings?
+// TODO
+//  we may want to change the cost of lateral motions when robot is
+//  near to goal. So no preference to fwd motion if robot is close to the goal
+//  but when far from goal, we may want to lateral motions be our last resort
+void HybridMotionTable::initOmni(
+    unsigned int & size_x_in,
+    unsigned int & size_y_in,
+    unsigned int & num_angle_quantization_in,
+    SearchInfo & search_info
+){
+  size_x = size_x_in;
+  change_penalty = search_info.change_penalty;
+  non_straight_penalty = search_info.non_straight_penalty;
+  cost_penalty = search_info.cost_penalty;
+  reverse_penalty = search_info.reverse_penalty;
+  travel_distance_reward = 1.0f - search_info.retrospective_penalty;
+  // if nothing changed, no need to re-compute primitives
+  if (num_angle_quantization_in == num_angle_quantization)
+  {
+    return;
+  }
+
+  num_angle_quantization = num_angle_quantization_in;
+  num_angle_quantization_float = static_cast<float>(num_angle_quantization);
+  min_turning_radius = search_info.minimum_turning_radius; // TODO, this must be defined in constants, and maybe fine tuned!
+
+  float angle = 2.0 * asin(sqrt(2.0) / (2 * min_turning_radius));
+
+  bin_size =
+      2.0f * static_cast<float>(M_PI) / static_cast<float>(num_angle_quantization);
+  float increments;
+  if (angle < bin_size) {
+    increments = 1.0f;
+  } else {
+    // Search dimensions are clean multiples of quantization - this prevents
+    // paths with loops in them TODO I cant get this!
+    increments = ceil(angle / bin_size);
+  }
+  angle = increments * bin_size;
+
+
+  float delta_x = min_turning_radius * sin(angle);
+  float delta_y = min_turning_radius - (min_turning_radius * cos(angle));
+
+  projections.clear();
+  projections.reserve(7);
+  projections.emplace_back(hypotf(delta_x, delta_y), 0.0, 0.0);  // Forward
+  projections.emplace_back(3*hypotf(delta_x, delta_y), 0.0, 0.0);  // Forward
+  projections.emplace_back(0.0,hypotf(delta_x, delta_y), 0.0); // Lateral Left
+  projections.emplace_back(0.0,-hypotf(delta_x, delta_y), 0.0); // Lateral Right
+  projections.emplace_back(0.0,0.0, 1.0); // Turn Inplace Left
+  projections.emplace_back(0.0,0.0, -1.0); // Turn Inplace Right
+  projections.emplace_back(-hypotf(delta_x, delta_y), 0.0, 0.0);  // Backward
+
+
+  // Create the correct OMPL state space
+  if (!state_space) {
+    state_space = std::make_unique<ompl::base::ReedsSheppStateSpace>(min_turning_radius);
+  }
+  // Precompute projection deltas
+  delta_xs.resize(projections.size());
+  delta_ys.resize(projections.size());
+  trig_values.resize(num_angle_quantization);
+
+  for (unsigned int i = 0; i != projections.size(); i++) {
+    delta_xs[i].resize(num_angle_quantization);
+    delta_ys[i].resize(num_angle_quantization);
+
+    for (unsigned int j = 0; j != num_angle_quantization; j++) {
+      double cos_theta = cos(bin_size * j);
+      double sin_theta = sin(bin_size * j);
+      if (i == 0) {
+        // if first iteration, cache the trig values for later
+        trig_values[j] = {cos_theta, sin_theta};
+      }
+      delta_xs[i][j] = projections[i]._x * cos_theta - projections[i]._y * sin_theta;
+      delta_ys[i][j] = projections[i]._x * sin_theta + projections[i]._y * cos_theta;
+    }
+  }
+}
+
 MotionPoses HybridMotionTable::getProjections(const NodeHybrid * node)
 {
   MotionPoses projection_list;
@@ -319,23 +411,53 @@ float NodeHybrid::getTraversalCost(const NodePtr & child)
     NodeHybrid::travel_distance_cost *
     (motion_table.travel_distance_reward + motion_table.cost_penalty * normalized_cost);
 
-  if (child->getMotionPrimitiveIndex() == 0 || child->getMotionPrimitiveIndex() == 3) {
-    // New motion is a straight motion, no additional costs to be applied
-    travel_cost = travel_cost_raw;
-  } else {
-    if (getMotionPrimitiveIndex() == child->getMotionPrimitiveIndex()) {
-      // Turning motion but keeps in same direction: encourages to commit to turning if starting it
-      travel_cost = travel_cost_raw * motion_table.non_straight_penalty;
-    } else {
-      // Turning motion and changing direction: penalizes wiggling
-      travel_cost = travel_cost_raw *
-        (motion_table.non_straight_penalty + motion_table.change_penalty);
+  const unsigned int child_motion_primitive_index = child->getMotionPrimitiveIndex();
+  if(motion_model_ == MotionModel::OMNI) {
+    if (child_motion_primitive_index <= 3 || child_motion_primitive_index ==6 ) {
+      // New motion is a straight motion (fwd, backwd, and lateral) , no additional costs to be applied
+      travel_cost = travel_cost_raw;
+    } 
+    if (child_motion_primitive_index == 1){
+      travel_cost*=3;
+    }
+    if (child_motion_primitive_index == 2 || child_motion_primitive_index ==3 ) {
+      // lateral has more cost than fwd
+      travel_cost_raw = NodeHybrid::lateral_motion_cost*(motion_table.travel_distance_reward + motion_table.cost_penalty * normalized_cost);
+      travel_cost = travel_cost_raw;
+    } 
+    if (child_motion_primitive_index == 4 || child_motion_primitive_index == 5) {
+      //turn in place cost is less than straight motions cost
+      travel_cost_raw = NodeHybrid::turn_inplace_cost*(motion_table.travel_distance_reward + motion_table.cost_penalty * normalized_cost);
+      travel_cost = travel_cost_raw;
+    }
+    if (getMotionPrimitiveIndex() != child_motion_primitive_index) {
+      // penalizes wiggling
+      travel_cost = travel_cost_raw * (1+motion_table.change_penalty);
+    }
+    if (getMotionPrimitiveIndex() ==6) {
+      // reverse direction
+      travel_cost *= motion_table.reverse_penalty;
     }
   }
+  else{ // for DUBIN and REEDS_SHEPP
+    if (child->getMotionPrimitiveIndex() == 0 || child->getMotionPrimitiveIndex() == 3) {
+      // New motion is a straight motion, no additional costs to be applied
+      travel_cost = travel_cost_raw;
+    } else {
+      if (getMotionPrimitiveIndex() == child->getMotionPrimitiveIndex()) {
+        // Turning motion but keeps in same direction: encourages to commit to turning if starting it
+        travel_cost = travel_cost_raw * motion_table.non_straight_penalty;
+      } else {
+        // Turning motion and changing direction: penalizes wiggling
+        travel_cost = travel_cost_raw *
+          (motion_table.non_straight_penalty + motion_table.change_penalty);
+      }
+    }
 
-  if (child->getMotionPrimitiveIndex() > 2) {
-    // reverse direction
-    travel_cost *= motion_table.reverse_penalty;
+    if (child->getMotionPrimitiveIndex() > 2) {
+      // reverse direction
+      travel_cost *= motion_table.reverse_penalty;
+    }
   }
 
   return travel_cost;
@@ -360,6 +482,7 @@ void NodeHybrid::initMotionModel(
   SearchInfo & search_info)
 {
   // find the motion model selected
+  motion_model_ = motion_model; // keep track of motion model
   switch (motion_model) {
     case MotionModel::DUBIN:
       motion_table.initDubin(size_x, size_y, num_angle_quantization, search_info);
@@ -367,11 +490,15 @@ void NodeHybrid::initMotionModel(
     case MotionModel::REEDS_SHEPP:
       motion_table.initReedsShepp(size_x, size_y, num_angle_quantization, search_info);
       break;
+    case MotionModel::OMNI:
+      motion_table.initOmni(size_x, size_y, num_angle_quantization, search_info);
+      break;
     default:
       throw std::runtime_error(
               "Invalid motion model for Hybrid A*. Please select between"
               " Dubin (Ackermann forward only),"
-              " Reeds-Shepp (Ackermann forward and back).");
+              " Reeds-Shepp (Ackermann forward and back),"
+              " Omni (Holonomic drive).");
   }
 
   travel_distance_cost = motion_table.projections[0]._x;
@@ -621,7 +748,7 @@ void NodeHybrid::precomputeDistanceHeuristic(
   if (motion_model == MotionModel::DUBIN) {
     motion_table.state_space = std::make_unique<ompl::base::DubinsStateSpace>(
       search_info.minimum_turning_radius);
-  } else if (motion_model == MotionModel::REEDS_SHEPP) {
+  } else if (motion_model == MotionModel::REEDS_SHEPP || motion_model == MotionModel::OMNI) {
     motion_table.state_space = std::make_unique<ompl::base::ReedsSheppStateSpace>(
       search_info.minimum_turning_radius);
   } else {

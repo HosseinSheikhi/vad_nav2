@@ -135,7 +135,7 @@ void SmacPlannerHybrid::configure(
     RCLCPP_WARN(
       _logger,
       "Unable to get MotionModel search type. Given '%s', "
-      "valid options are MOORE, VON_NEUMANN, DUBIN, REEDS_SHEPP, STATE_LATTICE.",
+      "valid options are MOORE, VON_NEUMANN, DUBIN, REEDS_SHEPP, STATE_LATTICE, OMNI.",
       _motion_model_for_search.c_str());
   }
 
@@ -315,7 +315,7 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
   int num_iterations = 0;
   std::string error;
   try {
-    if (!_a_star->createPath(path, num_iterations, 0.0)) {
+    if (!_a_star->createPath(path, num_iterations, 0.25 / static_cast<float>(costmap->getResolution()))) { // if disabling analytic expansion for OMNI, cant achive 0 tolerance
       if (num_iterations < _a_star->getMaxIterations()) {
         error = std::string("no valid path found");
       } else {
